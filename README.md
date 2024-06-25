@@ -72,7 +72,7 @@ cobra.CheckErr(err) // check for any error that occured
 err = cfg.Check(appConfig) // check the rules specified in the `config` tag
 cobra.CheckErr(err) // check for any error that occured
 
-err = appConfig.Check() // run any custom checks
+err = appConfig.Setup() // run any custom checks
 cobra.CheckErr(err) // check for any error that occured
 
 ```

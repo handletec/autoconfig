@@ -159,7 +159,8 @@ func (c *Config) ReadEnv(s any) (err error) {
 
 	}
 
-	viper.AutomaticEnv() // read in environment variables that match
+	// the following line is commented out since it is no longer required
+	//viper.AutomaticEnv() // read in environment variables that match
 
 	err = viper.Unmarshal(s) // read the environment variables into this struct
 	if nil != err {

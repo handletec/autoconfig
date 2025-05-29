@@ -15,6 +15,7 @@ type AppConfig struct {
 	Address string   `mapstructure:"ADDRESS" config:"default=127.0.0.1"`
 	Port    int      `mapstructure:"PORT" config:"default=8000"`
 	Origin  []string `mapstructure:"ORIGIN"`
+	Enabled bool     `mapstructure:"ENABLED"`
 }
 
 func (appConfig *AppConfig) String() (str string) {
@@ -33,6 +34,7 @@ func TestAutoConfig(t *testing.T) {
 	t.Setenv(EnvPrefix+"_ADDRESS", "::1")
 	t.Setenv(EnvPrefix+"_PORT", "9000")
 	t.Setenv(EnvPrefix+"_ORIGIN", "localhost, ::1, 127.0.0.1")
+	t.Setenv(EnvPrefix+"_ENABLED", "true")
 
 	cfg := autoconfig.New()     // create a new instance of `autoconfig`
 	appConfig := new(AppConfig) // create new instance of `AppConfig`

@@ -36,10 +36,10 @@ func TestAutoConfig(t *testing.T) {
 	t.Setenv(EnvPrefix+"_ORIGIN", "localhost, ::1, 127.0.0.1")
 	t.Setenv(EnvPrefix+"_ENABLED", "true")
 
-	cfg := autoconfig.New()     // create a new instance of `autoconfig`
-	appConfig := new(AppConfig) // create new instance of `AppConfig`
+	cfg := autoconfig.New(EnvPrefix) // create a new instance of `autoconfig`
+	appConfig := new(AppConfig)      // create new instance of `AppConfig`
 
-	cfg.SetEnvPrefix(EnvPrefix)   // pass the base environment variable for `Viper`. This helps distinguish variable names for specific applications
+	//cfg.SetEnvPrefix(EnvPrefix)   // pass the base environment variable for `Viper`. This helps distinguish variable names for specific applications
 	err := cfg.ReadEnv(appConfig) // read the environment variables and populates the given structure
 	if nil != err {
 		fmt.Println(err)

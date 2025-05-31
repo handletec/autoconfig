@@ -1,8 +1,11 @@
 module github.com/handletec/autoconfig
 
-go 1.21.3
+go 1.23.4
 
-require github.com/spf13/viper v1.20.1
+require (
+	github.com/spf13/viper v1.20.1
+	github.com/svicknesh/enum2str v1.0.1
+)
 
 require (
 	github.com/fsnotify/fsnotify v1.8.0 // indirect

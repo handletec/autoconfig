@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/spf13/viper"
 )
@@ -23,16 +24,32 @@ type Config struct {
 	cfgType                       ConfigType
 	envPrefix                     string
 	msTag                         map[string]string
+	structFields                  map[reflect.Type][]fieldMeta // cache for Check
+	mu                            sync.RWMutex
+}
+
+// fieldMeta holds tag metadata for each struct field.
+type fieldMeta struct {
+	name     string // Go field name
+	mapTag   string // mapstructure tag
+	kind     reflect.Kind
+	default_ *string // default value if provided
+	required bool    // whether this field is required
 }
 
 var allowedRegex = regexp.MustCompile(`[^a-z0-9 ]+`)
 
 // New - creates a new configuration
-func New() (c *Config) {
-	c = new(Config)
-	c.msTag = make(map[string]string)
+func New(prefix string) (c *Config) {
+	c = &Config{
+		msTag:        make(map[string]string),
+		structFields: make(map[reflect.Type][]fieldMeta),
+		envPrefix:    prefix,
+	}
 
-	return
+	viper.SetEnvPrefix(prefix)
+
+	return c
 }
 
 // Create - creates the directory for any application specific configuration files
@@ -49,8 +66,8 @@ func (c *Config) Create(project, baseCfgName, baseDirname string, cfgType Config
 	if !cfgType.IsValid() {
 		cfgType = ConfigTypeYAML // if an unknown type is given, default to YAML
 	}
-	c.cfgType = cfgType
 
+	c.cfgType = cfgType
 	c.project = "." + allowedRegex.ReplaceAllString(strings.ToLower(project), "")
 	c.cfgBaseName = allowedRegex.ReplaceAllString(strings.ToLower(baseCfgName), "")
 
@@ -70,7 +87,7 @@ func (c *Config) Create(project, baseCfgName, baseDirname string, cfgType Config
 		}
 	}
 
-	err = os.MkdirAll(c.dirname, 0600) // create the directory with permission for user only
+	err = os.MkdirAll(c.dirname, 0700) // create the directory with permission for user only
 	if nil != err {
 		return fmt.Errorf("config init: error creating '%s' directory -> %w", c.dirname, err)
 	}
@@ -98,76 +115,68 @@ func (c *Config) ReadFile(s any) (err error) {
 	return
 }
 
+/*
 // SetEnvPrefix - sets the environment prefix unique to the application to read environment variables
 func (c *Config) SetEnvPrefix(prefix string) {
 	c.envPrefix = prefix
 	viper.SetEnvPrefix(c.envPrefix)
 }
+*/
 
-// ReadEnv - reads the configuration parameters from env and populates the given structure
+// ReadEnv - binds environment variables (by mapstructure tags) and unmarshals into the given structure.
+// It populates c.msTag so Check() later knows which fields came from env.
 func (c *Config) ReadEnv(s any) (err error) {
 
-	// read the tags we need and populate the structure after if it passes
-	val := reflect.ValueOf(s)
-
-	if val.Kind().String() != "ptr" {
-		return fmt.Errorf("read environment: pass a pointer instead of '%s'", val.Kind().String())
+	// 1) Must be a non‐nil pointer to a struct
+	rv := reflect.ValueOf(s)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("read environment: pass a pointer instead of '%s'", rv.Kind())
+	}
+	rv = rv.Elem()
+	if rv.Kind() != reflect.Struct {
+		return fmt.Errorf("read environment: underlying pointer type struct expected to populate, '%s' provided", rv.Kind())
 	}
 
-	// de-reference the given object to get its underlying type
-	val = reflect.Indirect(reflect.ValueOf(s))
+	// Cache type info once
+	rt := rv.Type()
+	numFields := rt.NumField()
 
-	if val.Kind().String() != "struct" {
-		// we expect a struct to be given, otherwise return an error
-		return fmt.Errorf("read environment: underlying pointer type struct expected to populate, '%s' provided", val.Kind().String())
-	}
+	// 2) Iterate over each exported field
+	for i := 0; i < numFields; i++ {
+		sf := rt.Field(i)
 
-	var structField reflect.StructField
-	var tags string
-	// parse the 'tagMapStructure' tag to bind to viper environment variables
+		// 2a) Skip unexported fields immediately
+		if sf.PkgPath != "" {
+			continue
+		}
 
-	for i := 0; i < val.NumField(); i++ {
-		structField = val.Type().Field(i)
+		fv := rv.Field(i)
 
-		// we parse the config tag to see if a structure is given for us to delve further
-		tags = structField.Tag.Get(tagConfig)
-		if len(tags) != 0 {
-			switch strings.ToLower(tags) {
-			case "struct":
-				// a structure is given, we need to delve further
-				//fmt.Println("delving into", structField.Name)
-				// err = c.ReadEnv(val.FieldByName(structField.Name).Addr().Interface())
-				if val.CanAddr() {
-					err = c.ReadEnv(val.FieldByName(structField.Name).Addr().Interface())
-					if nil != err {
-						return fmt.Errorf("read enviroment: error delving into struct '%s' -> %w", structField.Name, err)
-					}
+		// 2b) If tagConfig:"struct", descend recursively
+		if rawTag, ok := sf.Tag.Lookup(tagConfig); ok && strings.EqualFold(rawTag, "struct") {
+			if fv.CanAddr() {
+				nestedPtr := fv.Addr().Interface()
+				if err := c.ReadEnv(nestedPtr); err != nil {
+					return fmt.Errorf(
+						"read environment: error delving into nested struct '%s' -> %w",
+						sf.Name, err,
+					)
 				}
 			}
 		}
 
-		tags = structField.Tag.Get(tagMapStructure)
-		//tags := val.Type().Field(i).Tag.Get(tagConfig)
-		//fmt.Printf("Field: %s, Tags: %s\n", val.Type().Field(i).Name, tags)
-
-		// only condition to bind the env
-		if len(tags) != 0 && tags != "-" {
-			//fmt.Printf("setting environment variable %s_%s\n", c.envPrefix, tags)
-			viper.BindEnv(tags)
-			c.msTag[structField.Name] = tags
+		// 2c) If mapstructure tag exists (and is not "-"), bind it
+		if mapTag, ok := sf.Tag.Lookup(tagMapStructure); ok && mapTag != "-" {
+			_ = viper.BindEnv(mapTag)
+			c.msTag[sf.Name] = mapTag
 		}
-
 	}
 
-	// the following line is commented out since it is no longer required
-	//viper.AutomaticEnv() // read in environment variables that match
-
-	err = viper.Unmarshal(s) // read the environment variables into this struct
-	if nil != err {
+	// 3) Finally, unmarshal all bound variables in one shot
+	if err := viper.Unmarshal(s); err != nil {
 		return fmt.Errorf("read environment: error unmarshaling to struct -> %w", err)
 	}
-
-	return
+	return nil
 }
 
 // Check - processes the struct to make sure everthing is valid
@@ -177,7 +186,6 @@ func (c *Config) Check(s any) (err error) {
 
 	// read the tags we need and populate the structure after if it passes
 	val := reflect.ValueOf(s)
-	//fmt.Println(val.Kind().String(), val.CanSet(), val.CanAddr(), val.Interface())
 
 	if val.Kind().String() != "ptr" {
 		return fmt.Errorf("config check: pass a pointer instead of '%s'", val.Kind().String())

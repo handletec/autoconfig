@@ -62,10 +62,9 @@ func (appConfig *AppConfig) Setup() (err error) {
 	return
 }
 
-cfg := autoconfig.New() // create a new instance of `autoconfig`
+cfg := autoconfig.New(EnvPrefix) // create a new instance of `autoconfig` and pass the base environment variable for `Viper`. This helps distinguish variable names for specific applications
 appConfig = new(AppConfig) // create new instance of `AppConfig`
 
-cfg.SetEnvPrefix(EnvPrefix) // pass the base environment variable for `Viper`. This helps distinguish variable names for specific applications
 err := cfg.ReadEnv(appConfig) // read the environment variables and populates the given structure
 cobra.CheckErr(err) // check for any error that occured
 

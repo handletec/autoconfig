@@ -1,5 +1,7 @@
 package autoconfig
 
+import "github.com/svicknesh/enum2str"
+
 type ConfigType uint8
 
 const (
@@ -13,13 +15,5 @@ func (ct ConfigType) IsValid() (valid bool) {
 }
 
 func (ct ConfigType) String() (str string) {
-
-	ctName := []string{"none", "yaml", "json"}
-	ctInt := int(ct)
-
-	if ctInt < 0 || ctInt > len(ctName) {
-		ctInt = 0 // if an unknown config type is given, set to none as default
-	}
-
-	return ctName[ctInt]
+	return enum2str.String(ct, "none", "yaml", "json")
 }

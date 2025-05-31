@@ -18,294 +18,328 @@ const (
 	tagMapStructure = "mapstructure" // viper uses this to read environment variables
 )
 
-// Config - configuration structure
+var allowedRegex = regexp.MustCompile(`[^a-z0-9 ]+`)
+
+// ----------------------------------------------------------------
+// Config holds state for reading & validating configuration.
+// ----------------------------------------------------------------
+
 type Config struct {
 	project, dirname, cfgBaseName string
 	cfgType                       ConfigType
 	envPrefix                     string
 	msTag                         map[string]string
-	structFields                  map[reflect.Type][]fieldMeta // cache for Check
-	mu                            sync.RWMutex
+
+	// For caching field metadata per‐type:
+	structFields map[reflect.Type][]fieldMeta
+	mu           sync.RWMutex
 }
 
-// fieldMeta holds tag metadata for each struct field.
+// fieldMeta holds pre‐parsed tag info for one struct field.
 type fieldMeta struct {
-	name     string // Go field name
-	mapTag   string // mapstructure tag
-	kind     reflect.Kind
-	default_ *string // default value if provided
-	required bool    // whether this field is required
+	name       string  // Go field name
+	index      []int   // reflect index path (always [i] for top‐level fields)
+	mapTag     string  // contents of `mapstructure:"..."`
+	required   bool    // did tag include "required"?
+	defaultVal *string // default value string if tag included `default=...`
+	isStruct   bool    // did tagConfig have exactly "struct"?
 }
 
-var allowedRegex = regexp.MustCompile(`[^a-z0-9 ]+`)
-
-// New - creates a new configuration
-func New(prefix string) (c *Config) {
-	c = &Config{
+// New creates a new Config, setting up maps & env prefix.
+func New(prefix string) *Config {
+	c := &Config{
 		msTag:        make(map[string]string),
 		structFields: make(map[reflect.Type][]fieldMeta),
 		envPrefix:    prefix,
 	}
-
 	viper.SetEnvPrefix(prefix)
-
 	return c
 }
 
-// Create - creates the directory for any application specific configuration files
-func (c *Config) Create(project, baseCfgName, baseDirname string, cfgType ConfigType) (err error) {
-
-	if len(project) == 0 {
+// Create sets up config directory & viper file settings.
+func (c *Config) Create(
+	project, baseCfgName, baseDirname string,
+	cfgType ConfigType,
+) error {
+	if project == "" {
 		return fmt.Errorf("config init: missing project name")
 	}
-
-	if len(baseCfgName) == 0 {
+	if baseCfgName == "" {
 		return fmt.Errorf("config init: missing config base file name")
 	}
-
 	if !cfgType.IsValid() {
-		cfgType = ConfigTypeYAML // if an unknown type is given, default to YAML
+		cfgType = ConfigTypeYAML
 	}
-
 	c.cfgType = cfgType
 	c.project = "." + allowedRegex.ReplaceAllString(strings.ToLower(project), "")
 	c.cfgBaseName = allowedRegex.ReplaceAllString(strings.ToLower(baseCfgName), "")
 
-	if len(baseDirname) == 0 {
-		// Find home directory.
-		home, err := os.UserHomeDir()
-		if nil != err {
-			return fmt.Errorf("config init: getting home dir -> %w", err)
+	var err error
+	if baseDirname == "" {
+		home, e := os.UserHomeDir()
+		if e != nil {
+			return fmt.Errorf("config init: getting home dir → %w", e)
 		}
-
 		c.dirname = filepath.Join(home, project)
-
 	} else {
 		c.dirname, err = filepath.Abs(filepath.Clean(baseDirname))
-		if nil != err {
-			return fmt.Errorf("config init: setting dirname -> %w", err)
+		if err != nil {
+			return fmt.Errorf("config init: setting dirname → %w", err)
 		}
 	}
 
-	err = os.MkdirAll(c.dirname, 0700) // create the directory with permission for user only
-	if nil != err {
-		return fmt.Errorf("config init: error creating '%s' directory -> %w", c.dirname, err)
+	if err := os.MkdirAll(c.dirname, 0700); err != nil {
+		return fmt.Errorf("config init: error creating '%s' directory → %w", c.dirname, err)
 	}
 
 	viper.AddConfigPath(c.dirname)
 	viper.SetConfigType(c.cfgType.String())
 	viper.SetConfigName(c.cfgBaseName)
-
-	return
+	return nil
 }
 
-// ReadFile - reads the configuration parameters from file and populates the given structure
-func (c *Config) ReadFile(s any) (err error) {
-
-	err = viper.ReadInConfig()
-	if nil != err {
-		return fmt.Errorf("readfile: missing '%s.%s' config file in '%s'", c.cfgBaseName, c.cfgType.String(), c.dirname)
+// ReadFile instructs viper to read a config file and unmarshal into `s`.
+// `s` must be a pointer to a struct.
+func (c *Config) ReadFile(s any) error {
+	if err := viper.ReadInConfig(); err != nil {
+		return fmt.Errorf(
+			"readfile: missing '%s.%s' config in '%s'",
+			c.cfgBaseName, c.cfgType.String(), c.dirname,
+		)
 	}
-
-	err = viper.Unmarshal(s)
-	if nil != err {
-		return fmt.Errorf("readfile: error reading '%s.%s' config file in '%s' -> %w", c.cfgBaseName, c.cfgType.String(), c.dirname, err)
+	if err := viper.Unmarshal(s); err != nil {
+		return fmt.Errorf(
+			"readfile: error reading '%s.%s' config in '%s' → %w",
+			c.cfgBaseName, c.cfgType.String(), c.dirname, err,
+		)
 	}
-
-	return
+	return nil
 }
 
-/*
-// SetEnvPrefix - sets the environment prefix unique to the application to read environment variables
-func (c *Config) SetEnvPrefix(prefix string) {
-	c.envPrefix = prefix
-	viper.SetEnvPrefix(c.envPrefix)
-}
-*/
-
-// ReadEnv - binds environment variables (by mapstructure tags) and unmarshals into the given structure.
-// It populates c.msTag so Check() later knows which fields came from env.
-func (c *Config) ReadEnv(s any) (err error) {
-
-	// 1) Must be a non‐nil pointer to a struct
+// ReadEnv binds environment variables using each field’s `mapstructure` tag
+// and then unmarshals into `s`.  It also records `msTag` for later validation.
+func (c *Config) ReadEnv(s any) error {
+	// 1) Must be a non‐nil pointer to struct
 	rv := reflect.ValueOf(s)
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
-		return fmt.Errorf("read environment: pass a pointer instead of '%s'", rv.Kind())
+		return fmt.Errorf(
+			"read environment: expected pointer, got %s",
+			rv.Kind(),
+		)
 	}
 	rv = rv.Elem()
 	if rv.Kind() != reflect.Struct {
-		return fmt.Errorf("read environment: underlying pointer type struct expected to populate, '%s' provided", rv.Kind())
+		return fmt.Errorf(
+			"read environment: expected pointer to struct, got pointer to %s",
+			rv.Kind(),
+		)
 	}
 
-	// Cache type info once
+	// 2) Iterate top‐level fields, bind env if mapstructure tag is present
 	rt := rv.Type()
-	numFields := rt.NumField()
-
-	// 2) Iterate over each exported field
-	for i := 0; i < numFields; i++ {
+	for i := 0; i < rt.NumField(); i++ {
 		sf := rt.Field(i)
-
-		// 2a) Skip unexported fields immediately
 		if sf.PkgPath != "" {
-			continue
+			continue // skip unexported
 		}
 
-		fv := rv.Field(i)
-
-		// 2b) If tagConfig:"struct", descend recursively
+		// 2a) If tagConfig:"struct", recurse into nested struct
 		if rawTag, ok := sf.Tag.Lookup(tagConfig); ok && strings.EqualFold(rawTag, "struct") {
+			fv := rv.Field(i)
 			if fv.CanAddr() {
-				nestedPtr := fv.Addr().Interface()
-				if err := c.ReadEnv(nestedPtr); err != nil {
+				if err := c.ReadEnv(fv.Addr().Interface()); err != nil {
 					return fmt.Errorf(
-						"read environment: error delving into nested struct '%s' -> %w",
+						"read environment: nested struct '%s' → %w",
 						sf.Name, err,
 					)
 				}
 			}
 		}
 
-		// 2c) If mapstructure tag exists (and is not "-"), bind it
+		// 2b) Bind env by mapstructure tag
 		if mapTag, ok := sf.Tag.Lookup(tagMapStructure); ok && mapTag != "-" {
 			_ = viper.BindEnv(mapTag)
 			c.msTag[sf.Name] = mapTag
 		}
 	}
 
-	// 3) Finally, unmarshal all bound variables in one shot
+	// 3) Unmarshal all bound env vars at once
 	if err := viper.Unmarshal(s); err != nil {
-		return fmt.Errorf("read environment: error unmarshaling to struct -> %w", err)
+		return fmt.Errorf("read environment: error unmarshaling → %w", err)
 	}
 	return nil
 }
 
-// Check - processes the struct to make sure everthing is valid
-func (c *Config) Check(s any) (err error) {
+// getOrBuildFieldMeta returns a slice of fieldMeta for type `rt`.
+// It caches the result so that each struct’s tags are parsed once.
+// Returns an error if any `config:"..."` tag is malformed.
+func (c *Config) getOrBuildFieldMeta(rt reflect.Type) ([]fieldMeta, error) {
+	// 1) Fast path: check if already cached
+	c.mu.RLock()
+	if metas, found := c.structFields[rt]; found {
+		c.mu.RUnlock()
+		return metas, nil
+	}
+	c.mu.RUnlock()
 
-	//fmt.Println(c.msTag)
+	// 2) Build under write‐lock
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// read the tags we need and populate the structure after if it passes
-	val := reflect.ValueOf(s)
-
-	if val.Kind().String() != "ptr" {
-		return fmt.Errorf("config check: pass a pointer instead of '%s'", val.Kind().String())
+	// Another goroutine may have cached meanwhile
+	if metas, found := c.structFields[rt]; found {
+		return metas, nil
 	}
 
-	// de-reference the given object to get its underlying type
-	val = reflect.Indirect(reflect.ValueOf(s))
+	var list []fieldMeta
+	numFields := rt.NumField()
 
-	if val.Kind().String() != "struct" {
-		// we expect a struct to be given, otherwise return an error
-		return fmt.Errorf("config check: underlying pointer type struct expected to populate, '%s' provided", val.Kind().String())
-	}
-
-	var structField reflect.StructField
-	var tags string
-
-	var fieldValue reflect.Value
-	var msTag string
-	//var ok bool
-
-	// parse the 'tagConfig' tag to process the necessary rules
-
-	for i := 0; i < val.NumField(); i++ {
-		structField = val.Type().Field(i)
-		tags = structField.Tag.Get(tagConfig)
-		//tags := val.Type().Field(i).Tag.Get(tagConfig)
-		//fmt.Printf("Field: %s, Tags: %s\n", val.Type().Field(i).Name, tags)
-
-		// we don't skip this because it could be a `struct` tag which will drill deeper
-		/*
-			// only continue if this field was set in the map for viper, otherwise it is a waste of time
-			if msTag, ok = c.msTag[structField.Name]; !ok {
-				continue // move to next item since this field is not processed for viper
-			}
-		*/
-
-		msTag = c.msTag[structField.Name]
-
-		if len(tags) == 0 || tags == "-" {
-			continue // move on to next item, nothing for this library to do
+	for i := 0; i < numFields; i++ {
+		sf := rt.Field(i)
+		if sf.PkgPath != "" {
+			continue // skip unexported
 		}
 
-		tagParts := strings.Split(tags, ",")
-		//fmt.Println(tagParts)
+		rawTag, ok := sf.Tag.Lookup(tagConfig)
+		if !ok || rawTag == "-" {
+			continue
+		}
 
-		fieldValue = val.Field(i)
+		// Split “config” tag on commas once
+		parts := strings.Split(rawTag, ",")
+		var fm fieldMeta
+		fm.name = sf.Name
+		fm.index = []int{i}
 
-		for _, t := range tagParts {
-			kv := strings.Split(t, "=")
-			//fmt.Println(kv)
-
-			switch strings.ToLower(kv[0]) {
-
-			case "struct":
-				// a structure is given, we need to delve further
-				//fmt.Println("delving into", structField.Name)
-				// err = c.ReadEnv(val.FieldByName(structField.Name).Addr().Interface())
-				if val.CanAddr() {
-					err = c.Check(val.FieldByName(structField.Name).Addr().Interface())
-					if nil != err {
-						return fmt.Errorf("read enviroment: error delving into struct '%s' -> %w", structField.Name, err)
-					}
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			switch {
+			case strings.EqualFold(part, "struct"):
+				fm.isStruct = true
+			case strings.EqualFold(part, "required"):
+				fm.required = true
+			case strings.HasPrefix(part, "default="):
+				kv := strings.SplitN(part, "=", 2)
+				if len(kv) == 2 {
+					val := kv[1]
+					fm.defaultVal = &val
 				}
-
-			case "required":
-				if fieldValue.IsZero() {
-					return fmt.Errorf("config check: missing 'required' environment variable '%s_%s' for field '%s'", c.envPrefix, msTag, structField.Name)
-				}
-
-			case "default":
-
-				if !fieldValue.IsZero() {
-					continue // there is a value provided, continue to next item
-				}
-
-				if len(kv) != 2 {
-					// missing default value, return error
-					return fmt.Errorf("config check: missing 'default' value for field '%s'", structField.Name)
-				}
-
-				//fmt.Println(structField.Name, fieldValue.Kind().String(), fieldValue)
-
-				switch fieldValue.Kind() {
-				case reflect.Bool:
-					b, err := strconv.ParseBool(kv[1])
-					if nil != err {
-						return fmt.Errorf("config check: 'default' (%s) value for field '%s' error -> %w", structField.Type.Kind().String(), structField.Name, err)
-					}
-					reflect.ValueOf(s).Elem().FieldByName(structField.Name).SetBool(b)
-
-				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-					i, err := strconv.ParseInt(kv[1], 10, 64)
-					if nil != err {
-						return fmt.Errorf("config check: 'default' (%s) value for field '%s' error -> %w", structField.Type.Kind().String(), structField.Name, err)
-					}
-					reflect.ValueOf(s).Elem().FieldByName(structField.Name).SetInt(i)
-
-				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-					i, err := strconv.ParseUint(kv[1], 10, 64)
-					if nil != err {
-						return fmt.Errorf("config check: 'default' (%s) value for field '%s' error -> %w", structField.Name, structField.Type.Kind().String(), err)
-					}
-					reflect.ValueOf(s).Elem().FieldByName(structField.Name).SetUint(i)
-
-				case reflect.Float32, reflect.Float64:
-					i, err := strconv.ParseFloat(kv[1], 64)
-					if nil != err {
-						return fmt.Errorf("config check: 'default' (%s) value for field '%s' error -> %w", structField.Name, structField.Type.Kind().String(), err)
-					}
-					reflect.ValueOf(s).Elem().FieldByName(structField.Name).SetFloat(i)
-
-				case reflect.String:
-					reflect.ValueOf(s).Elem().FieldByName(structField.Name).SetString(kv[1])
-
-				}
-
+				// ignore unrecognized tokens silently
 			}
 		}
 
+		// Record mapstructure tag (for error messaging)
+		if mapTag, ok := sf.Tag.Lookup(tagMapStructure); ok && mapTag != "-" {
+			fm.mapTag = mapTag
+		}
+
+		list = append(list, fm)
 	}
 
-	return
+	c.structFields[rt] = list
+	return list, nil
+}
+
+// Check validates “required” fields and applies “default=” defaults.
+// It recurses into nested structs when tagConfig:"struct" is present.
+// Uses cached fieldMeta for speed.
+// `s` must be pointer to struct.
+func (c *Config) Check(s any) error {
+	// 1) Must be a pointer to a non‐nil struct
+	rv := reflect.ValueOf(s)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("config check: expected pointer to struct, got %s", rv.Kind())
+	}
+	rv = rv.Elem()
+	if rv.Kind() != reflect.Struct {
+		return fmt.Errorf("config check: expected pointer to struct, got pointer to %s", rv.Kind())
+	}
+
+	// 2) Look up (or build) metadata for this struct type
+	rt := rv.Type()
+	metas, err := c.getOrBuildFieldMeta(rt)
+	if err != nil {
+		return err
+	}
+
+	// 3) Iterate only over those fields with a “config” tag
+	for _, fm := range metas {
+		fv := rv.FieldByIndex(fm.index)
+
+		// 3a) If this field is itself a nested struct marker, recurse
+		if fm.isStruct {
+			if fv.CanAddr() {
+				if err := c.Check(fv.Addr().Interface()); err != nil {
+					return fmt.Errorf("config check: nested struct %q → %w", fm.name, err)
+				}
+			}
+		}
+
+		// 3b) Required check
+		if fm.required && isZeroValue(fv) {
+			return fmt.Errorf(
+				"config check: missing required '%s_%s' for field '%s'",
+				c.envPrefix, fm.mapTag, fm.name,
+			)
+		}
+
+		// 3c) Default check (only if zero and defaultVal is set)
+		if isZeroValue(fv) && fm.defaultVal != nil {
+			if err := setFieldDefault(rv, fm, *fm.defaultVal); err != nil {
+				return fmt.Errorf("config check: default for field %q → %w", fm.name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// isZeroValue returns true if v is the zero value for its type.
+func isZeroValue(v reflect.Value) bool {
+	return v.IsZero()
+}
+
+// setFieldDefault writes the literal defaultStr into the field described by fm.
+func setFieldDefault(parent reflect.Value, fm fieldMeta, defaultStr string) error {
+	fv := parent.FieldByIndex(fm.index)
+	if !fv.CanSet() {
+		return fmt.Errorf("cannot set default on unaddressable field %q", fm.name)
+	}
+
+	switch fv.Kind() {
+	case reflect.Bool:
+		b, err := strconv.ParseBool(defaultStr)
+		if err != nil {
+			return fmt.Errorf("invalid bool default %q: %w", defaultStr, err)
+		}
+		fv.SetBool(b)
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		i, err := strconv.ParseInt(defaultStr, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid int default %q: %w", defaultStr, err)
+		}
+		fv.SetInt(i)
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		u, err := strconv.ParseUint(defaultStr, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid uint default %q: %w", defaultStr, err)
+		}
+		fv.SetUint(u)
+
+	case reflect.Float32, reflect.Float64:
+		fvlt, err := strconv.ParseFloat(defaultStr, 64)
+		if err != nil {
+			return fmt.Errorf("invalid float default %q: %w", defaultStr, err)
+		}
+		fv.SetFloat(fvlt)
+
+	case reflect.String:
+		fv.SetString(defaultStr)
+
+	default:
+		return fmt.Errorf("unsupported kind %s for default on %q", fv.Kind(), fm.name)
+	}
+	return nil
 }

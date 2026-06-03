@@ -1,77 +1,81 @@
 # Golang auto-config library
 
-This library populates environment variables a structure without having to repeat boilerplate code.
+`autoconfig` populates a Go struct from environment variables and optional config files with minimal boilerplate.
 
-# Details
+This version is hardened to avoid shared global state, reject unexpected file keys, and preserve explicit zero values such as `false` and `0` for required fields.
 
-When creating a `struct`, add the tags below to read the environment variables and populate the struct values. Default values can also be specified if no values are found. There are 2 tags that **MUST** exist for auto-populating are `config` and `mapstructure`. The `mapstructure` tag is used by `Viper` itself to populate the values read from the environment variable name whereas the `config` tag sets the rules for the values.
+## Key behavior
 
-The name in the `mapstructure` tag represents the environment variable name to be read.
+- Each `Config` instance owns its own Viper instance.
+- File decoding is strict: unknown keys cause an error.
+- Required checks use presence tracking, not only zero-value checks.
+- Defaults are applied only when a value was not provided.
+- Nested structs support combined tags such as `config:"struct,required"`.
+- Comma-separated environment variables are decoded into `[]string` with whitespace trimming.
 
-The possible parameters for the `config` config tag are
+The are 2 tags that **MUST** exist for auto-populating are `config` and `mapstructure`. The `mapstructure` tag is used by `Viper` itself to populate the values read from the environment variable name whereas the `config` tag sets the rules for the values.
 
-| name | description | 
+## Supported `config` options
+
+| option | description |
 | :-- | :-- |
-| `default` | default value to use if no environment variable value exists. |
-| `required` | an environment variable value **MUST** be provided. |
-| `struct` | if the variable type is a `struct`, use this tag, which allows it to delve into to populate the fields. |
-
+| `default=<value>` | default value to use when the field was not provided |
+| `required` | the value must be provided unless a default exists |
+| `struct` | recurse into a nested struct |
 
 ## Example
 
 ```go
+package main
 
-const (
-	// EnvPrefix - environment variable prefix
-	EnvPrefix = "TRAEFIK_ADGUARDHOME"
+import (
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/handletec/autoconfig"
 )
 
-// AppConfig - application configuration from config file or environment variables
 type AppConfig struct {
+    Address string        `yaml:"address" json:"address" mapstructure:"ADDRESS" config:"default=127.0.0.1"`
+    Port    int           `yaml:"port" json:"port" mapstructure:"PORT" config:"default=8080"`
+    Origin  []string      `yaml:"origin" json:"origin" mapstructure:"ORIGIN" config:"default=localhost,127.0.0.1"`
+    Timeout time.Duration `yaml:"timeout" json:"timeout" mapstructure:"TIMEOUT" config:"default=5s"`
 
-		Logger struct {
-			Format      string `yaml:"format" json:"format" mapstructure:"LOGGER_FORMAT" config:"default=kv"`                    // 'kv' or 'json'
-			MinLevel    string `yaml:"minLevel" json:"minLevel" mapstructure:"LOGGER_MIN_LEVEL" config:"default=info"`           // minimum level of logging - supported values are 'debug', 'info', 'warn', 'error'
-			Output      string `yaml:"output" json:"output" mapstructure:"LOGGER_OUTPUT" config:"default=stdout"`                // output for logging - 'stdout' or 'file'
-			Destination string `yaml:"destination" json:"destination" mapstructure:"LOGGER_DESTINATION" config:"default=stdout"` // destination for logging, only for 'file'		
-            handler  *slog.Logger
-		} `yaml:"logger" json:"logger" config:"struct"`
-
-
-	ServerIP string `yaml:"server_ip" json:"server_ip" mapstructure:"SERVER_IP" config:"required"`
-
-	Docker struct {
-		Address string `yaml:"value" json:"value" mapstructure:"DOCKER_ADDRESS" config:"default=unix:///var/run/docker.sock"`
-	} `yaml:"docker" json:"docker" config:"struct"`
-
-	AdguardHome struct {
-		Address  string `yaml:"address" json:"address" mapstructure:"ADDRESS" config:"required"`
-		Username string `yaml:"value" json:"value" mapstructure:"USERNAME" config:"required"`
-		Password string `yaml:"file" json:"file" mapstructure:"PASSWORD" config:"required"`
-	} `yaml:"adguardhome" json:"adguardhome" config:"struct"`
+    Features struct {
+        Enabled bool `yaml:"enabled" json:"enabled" mapstructure:"FEATURES_ENABLED" config:"required"`
+    } `yaml:"features" json:"features" config:"struct,required"`
 }
 
-func (appConfig *AppConfig) String() (str string) {
-	bytes, _ := json.Marshal(appConfig)
-	return string(bytes)
+func main() {
+    cfg := autoconfig.New("MYAPP")
+
+    if err := cfg.Create("myapp", "config", "", autoconfig.ConfigTypeYAML); err != nil {
+        log.Fatal(err)
+    }
+
+    appConfig := new(AppConfig)
+
+    // File is optional. Handle the error according to your application needs.
+    _ = cfg.ReadFile(appConfig)
+
+    if err := cfg.ReadEnv(appConfig); err != nil {
+        log.Fatal(err)
+    }
+
+    if err := cfg.Check(appConfig); err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Printf("%+v\n", appConfig)
 }
+```
 
-// Setup - set values for fields that depend on other values
-func (appConfig *AppConfig) Setup() (err error) {
-    // do any custom checks
-	return
-}
+## Testing
 
-cfg := autoconfig.New(EnvPrefix) // create a new instance of `autoconfig` and pass the base environment variable for `Viper`. This helps distinguish variable names for specific applications
-appConfig = new(AppConfig) // create new instance of `AppConfig`
+Run both of these in CI:
 
-err := cfg.ReadEnv(appConfig) // read the environment variables and populates the given structure
-cobra.CheckErr(err) // check for any error that occured
-
-err = cfg.Check(appConfig) // check the rules specified in the `config` tag
-cobra.CheckErr(err) // check for any error that occured
-
-err = appConfig.Setup() // run any custom checks
-cobra.CheckErr(err) // check for any error that occured
-
+```bash
+go test ./...
+go test -race ./...
 ```

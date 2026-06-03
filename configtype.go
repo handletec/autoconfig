@@ -1,7 +1,5 @@
 package autoconfig
 
-import "github.com/svicknesh/enum2str"
-
 type ConfigType uint8
 
 const (
@@ -10,10 +8,17 @@ const (
 	ConfigTypeJSON
 )
 
-func (ct ConfigType) IsValid() (valid bool) {
-	return ct.String() != "none"
+func (ct ConfigType) IsValid() bool {
+	return ct == ConfigTypeYAML || ct == ConfigTypeJSON
 }
 
-func (ct ConfigType) String() (str string) {
-	return enum2str.String(ct, "none", "yaml", "json")
+func (ct ConfigType) String() string {
+	switch ct {
+	case ConfigTypeYAML:
+		return "yaml"
+	case ConfigTypeJSON:
+		return "json"
+	default:
+		return "none"
+	}
 }

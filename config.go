@@ -204,6 +204,18 @@ func (c *Config) bindEnvStruct(rv reflect.Value, path []string) error {
 			continue
 		}
 
+		// A struct-typed field without config:"struct" must not be bound to a
+		// single env key. Its child fields need config:"struct" for recursion.
+		if !fm.isStruct {
+			ft := field.Type()
+			for ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				continue
+			}
+		}
+
 		if err := c.v.BindEnv(fm.mapTag); err != nil {
 			return fmt.Errorf("read environment: bind env for %q (%s): %w", fm.name, fm.mapTag, err)
 		}
@@ -286,8 +298,8 @@ func (c *Config) getOrBuildFieldMeta(rt reflect.Type) ([]fieldMeta, error) {
 			continue
 		}
 
-		rawTag, ok := sf.Tag.Lookup(tagConfig)
-		if !ok || rawTag == "-" {
+		rawTag := sf.Tag.Get(tagConfig)
+		if rawTag == "-" {
 			continue
 		}
 
@@ -300,7 +312,8 @@ func (c *Config) getOrBuildFieldMeta(rt reflect.Type) ([]fieldMeta, error) {
 		}
 
 		parts := strings.Split(rawTag, ",")
-		for _, part := range parts {
+	parseLoop:
+		for i, part := range parts {
 			part = strings.TrimSpace(part)
 			switch {
 			case part == "":
@@ -310,12 +323,22 @@ func (c *Config) getOrBuildFieldMeta(rt reflect.Type) ([]fieldMeta, error) {
 			case strings.EqualFold(part, "required"):
 				fm.required = true
 			case strings.HasPrefix(strings.ToLower(part), "default="):
-				kv := strings.SplitN(part, "=", 2)
+				// Policy tokens must precede default=. default= is terminal:
+				// everything after it (including commas) is the default value.
+				for _, tail := range parts[i+1:] {
+					tail = strings.TrimSpace(tail)
+					if strings.EqualFold(tail, "required") || strings.EqualFold(tail, "struct") {
+						return nil, fmt.Errorf("config tag on field %q: policy option %q must appear before default=", sf.Name, tail)
+					}
+				}
+				full := strings.Join(parts[i:], ",")
+				kv := strings.SplitN(full, "=", 2)
 				if len(kv) != 2 {
 					return nil, fmt.Errorf("config tag on field %q: invalid default expression %q", sf.Name, part)
 				}
 				value := kv[1]
 				fm.defaultVal = &value
+				break parseLoop
 			default:
 				return nil, fmt.Errorf("config tag on field %q: unsupported token %q", sf.Name, part)
 			}

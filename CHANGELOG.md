@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.1.1] — 2026-08-18
+
+### Fixes
+
+- **Nested environment-variable binding now correctly populates nested struct fields.** In v1.1.0 and earlier, environment variables for fields inside a `config:"struct"` nested struct were detected as present but never decoded into the nested Go field: `ReadEnv` recorded the field as explicitly supplied, so `Check()` skipped applying the configured default, but the field itself was left at its Go zero value. Environment overrides for nested string, integer, boolean, secret, listener, logging, and TLS configuration fields — including deeper recursive nesting — now populate the intended field correctly. Two nested structs sharing an identical leaf `mapstructure` field name no longer risk internal collision either.
+
+This is a correctness fix, not a new feature: nested `config:"struct"` env binding was always intended to work this way. Environment-variable names (`PREFIX_<mapstructure tag>`), the `config` tag syntax, the public API, and default behaviour when no environment value is supplied are all unchanged.
+
+### Upgrade note
+
+If an existing application already sets environment variables for fields inside a `config:"struct"` nested struct, those values were silently ignored under v1.1.0 and earlier — the field stayed at its zero value. After upgrading to v1.1.1, those environment variables will now take effect. This is corrected behaviour, not an API break, but verify your effective runtime configuration after upgrading if you rely on nested struct env binding.
+
+---
+
 ## [v1.1.0] — 2026-06-19
 
 ### Breaking change

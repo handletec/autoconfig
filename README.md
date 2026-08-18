@@ -50,7 +50,6 @@ Host string `mapstructure:"HOST" config:"default=localhost,required"`
 ## Known limitations
 
 - **`time.Time` is not env-bindable.** `time.Time` is a struct type. The library does not bind struct-typed fields to a single flat env key. Set `time.Time` fields from config files or application logic, not from environment variables. `time.Duration` works correctly because it is an `int64` underneath.
-- **Nested struct env binding uses flat keys.** Viper's flat-key model has limits with deeply nested structures. If nested struct env binding is not working as expected, use a flat struct with explicit `mapstructure` keys.
 - **Empty env vars are treated as absent.** Setting `FOO=""` applies the `default=` value or leaves the field at its zero value (`AllowEmptyEnv=false`, the Viper default).
 
 ## Example

@@ -170,7 +170,7 @@ func (c *Config) ReadEnv(s any) error {
 		return fmt.Errorf("read environment: %w", err)
 	}
 
-	if err := c.bindEnvStruct(rv, c.rootPathForType(rv.Type())); err != nil {
+	if err := c.bindEnvStruct(rv, c.rootPathForType(rv.Type()), nil); err != nil {
 		return err
 	}
 
@@ -181,7 +181,27 @@ func (c *Config) ReadEnv(s any) error {
 	return nil
 }
 
-func (c *Config) bindEnvStruct(rv reflect.Value, path []string) error {
+// bindEnvStruct binds environment variables for s's fields.
+//
+// path is the Go-field-name path used for presence tracking (see
+// c.present); it is independent per root struct type and never collides
+// across sibling struct types.
+//
+// viperPath is the hierarchical Viper key path used to register env
+// bindings. Each level uses the field's mapstructure tag when present,
+// falling back to the (lowercased) Go field name to match mapstructure's
+// own default field-matching behaviour when no tag is set. Viper's
+// Unmarshal decodes from a nested map built by splitting bound keys on its
+// key delimiter ("."); binding only a field's own leaf mapstructure tag
+// (the previous behaviour) registers the value under a flat top-level key
+// that never lines up with the nested struct shape, so the decoded value
+// is silently dropped even though the env var itself is present. Building
+// viperPath from the full ancestor chain keeps the internal Viper key
+// aligned with the struct's nesting so Unmarshal can actually populate the
+// field, while the OS-facing environment variable name is still derived
+// from the field's own leaf mapstructure tag only (mergeEnvPrefix), so the
+// documented PREFIX_<mapstructure tag> contract for consumers is unchanged.
+func (c *Config) bindEnvStruct(rv reflect.Value, path []string, viperPath []string) error {
 	metas, err := c.getOrBuildFieldMeta(rv.Type())
 	if err != nil {
 		return err
@@ -190,11 +210,12 @@ func (c *Config) bindEnvStruct(rv reflect.Value, path []string) error {
 	for _, fm := range metas {
 		field := rv.FieldByIndex(fm.index)
 		fieldPath := appendPath(path, fm.name)
+		childViperPath := appendPath(viperPath, viperKeySegment(fm))
 
 		if fm.isStruct {
 			nested, ok := ensureStructValue(field)
 			if ok {
-				if err := c.bindEnvStruct(nested, fieldPath); err != nil {
+				if err := c.bindEnvStruct(nested, fieldPath, childViperPath); err != nil {
 					return fmt.Errorf("read environment: nested struct %q: %w", fm.name, err)
 				}
 			}
@@ -216,16 +237,44 @@ func (c *Config) bindEnvStruct(rv reflect.Value, path []string) error {
 			}
 		}
 
-		if err := c.v.BindEnv(fm.mapTag); err != nil {
+		viperKey := pathKey(childViperPath)
+		osEnvName := mergeEnvPrefix(c.envPrefix, fm.mapTag)
+
+		if err := c.v.BindEnv(viperKey, osEnvName); err != nil {
 			return fmt.Errorf("read environment: bind env for %q (%s): %w", fm.name, fm.mapTag, err)
 		}
 
-		if c.v.IsSet(fm.mapTag) {
+		if c.v.IsSet(viperKey) {
 			c.recordPresence(fieldPath)
 		}
 	}
 
 	return nil
+}
+
+// viperKeySegment returns the path segment used to build the hierarchical
+// Viper key for fm. It mirrors how mapstructure resolves a struct field
+// when decoding: the field's own mapstructure tag when present, otherwise
+// the Go field name (mapstructure matches field names case-insensitively,
+// and Viper lowercases all internal keys, so exact case here is immaterial).
+func viperKeySegment(fm fieldMeta) string {
+	if fm.mapTag != "" && fm.mapTag != "-" {
+		return fm.mapTag
+	}
+	return fm.name
+}
+
+// mergeEnvPrefix reproduces Viper's private mergeWithEnvPrefix behaviour
+// (Viper always uppercases both the prefix and the key, which makes the
+// result independent of the original casing of either input) so the OS
+// environment variable name for a field's own leaf mapstructure tag is
+// unaffected by using the two-argument BindEnv form to bind a different
+// (hierarchical) internal Viper key.
+func mergeEnvPrefix(prefix, key string) string {
+	if prefix != "" {
+		return strings.ToUpper(prefix + "_" + key)
+	}
+	return strings.ToUpper(key)
 }
 
 // Check validates required fields and applies defaults.

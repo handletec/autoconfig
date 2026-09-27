@@ -20,6 +20,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full migration guide.
 - Defaults are applied only when a value was not provided.
 - Nested structs support combined tags such as `config:"struct,required"`.
 - Comma-separated environment variables are decoded into `[]string` with whitespace trimming.
+- Any environment-bindable **string** field also supports a sibling `_FILE` variable (e.g. `MYAPP_DB_PASSWORD_FILE`) to load the value from a file instead — see "Loading secrets from files" below.
 
 The `mapstructure` tag on an exported field determines the environment variable key that Viper binds to. Any exported field with a `mapstructure` tag is automatically eligible for environment binding. Use `config:"-"` to explicitly exclude a field.
 
@@ -46,6 +47,97 @@ Origins []string `mapstructure:"ORIGINS" config:"required,default=localhost,127.
 // Invalid: required after default= — returns a parse error
 Host string `mapstructure:"HOST" config:"default=localhost,required"`
 ```
+
+## Loading secrets from files (`_FILE`)
+
+Any exported field that is env-bindable and whose effective Go type is
+`string` (passwords, tokens, API keys, DSNs, signing secrets, and similar)
+also accepts its value from a file, using the Docker/Kubernetes
+secrets-file convention. No new struct tag is required — the existing
+`mapstructure` tag is sufficient.
+
+Given:
+
+```go
+type Config struct {
+    Password string `mapstructure:"DB_PASSWORD" config:"required"`
+}
+```
+
+and `cfg := autoconfig.New("MYAPP")`:
+
+- `MYAPP_DB_PASSWORD=super-secret` — existing behaviour, unchanged.
+- `MYAPP_DB_PASSWORD_FILE=/run/secrets/db_password` (file contains
+  `super-secret`) — after `cfg.ReadEnv(appConfig)`, `appConfig.Password ==
+  "super-secret"`.
+
+autoconfig (1) reads the path from `..._FILE`, (2) reads the file's contents
+directly, (3) places the resulting value into the config struct field —
+**it never creates, updates, or reads back a value into the corresponding
+plain environment variable.** After loading, `MYAPP_DB_PASSWORD_FILE` may
+exist in the environment, but `MYAPP_DB_PASSWORD` remains absent unless the
+caller separately supplied it.
+
+### Rules
+
+- **Direct value only:** unchanged existing behaviour.
+- **`_FILE` only:** the file is read and its value is applied to the field.
+  A successfully resolved `_FILE` value participates in presence tracking,
+  so `config:"required"` is satisfied by it, and a `default=` value never
+  overwrites it.
+- **Neither supplied:** unchanged existing behaviour (config-file value,
+  default, optional zero value, or a `required` validation failure).
+- **Both `MYAPP_DB_PASSWORD` and `MYAPP_DB_PASSWORD_FILE` set to non-empty
+  values:** `ReadEnv` returns an error naming both environment variable
+  names. Neither value is silently preferred, and neither value appears in
+  the error.
+- **Empty values:** `MYAPP_DB_PASSWORD=""` with a valid `_FILE` uses the
+  `_FILE` value. `MYAPP_DB_PASSWORD_FILE=""` is treated as though `_FILE`
+  were not supplied at all.
+- **Empty file content:** if the file's content, after removing exactly one
+  trailing line ending (see below), is empty, `_FILE` is treated as though
+  it were not supplied — no presence is recorded and no value is applied.
+  An optional field keeps its existing value, a field with `default=`
+  receives that default, and a `required` field with no default fails
+  required validation exactly as if `_FILE` had never been set.
+- **Unreadable or missing file:** `ReadEnv` returns a hard error identifying
+  the `_FILE` variable name and the file path, wrapping the underlying
+  filesystem error. There is no fallback to a default — a configured but
+  unreadable secret is a configuration failure.
+- **Non-string fields:** `_FILE` is only supported for a bare (non-pointer)
+  `string` field. Using it against an int, bool, duration, slice, struct,
+  `*string`, or any other pointer or type returns a clear "unsupported
+  type" error rather than being silently ignored or dereferenced.
+- **`config:"-"`** excludes a field, and its `_FILE` sibling, entirely.
+- **Nested structs:** works through `config:"struct"` nesting using the
+  existing flat OS environment-variable naming convention — a nested field
+  bound to `MYAPP_API_KEY` also accepts `MYAPP_API_KEY_FILE`.
+
+### Trailing newline convention
+
+Exactly one conventional trailing line ending is removed if present:
+`"secret\n"` → `"secret"`, `"secret\r\n"` → `"secret"`. `strings.TrimSpace`
+is never applied — surrounding spaces and internal newlines may be part of
+the actual secret and are preserved exactly: `" secret "` stays `" secret
+"`, and `"line1\nline2"` stays `"line1\nline2"`.
+
+### Security notes
+
+`_FILE` reduces accidental exposure through environment-variable inspection
+and logging. **It is not a full secret-management system.** Once loaded,
+the application necessarily holds the secret in memory like any other
+configuration value.
+
+**Autoconfig does not redact configuration structs.** Applications must not
+log or print configuration structs that contain secrets.
+
+### Rotation
+
+`_FILE` is read once, when `ReadEnv()` executes. Changing the file's
+contents afterward does not automatically update an already-loaded
+configuration value. Applications that require rotation should implement
+their own reload flow (e.g. calling `ReadEnv()` again in response to a
+signal) or use a dedicated secret-management mechanism.
 
 ## Known limitations
 
@@ -99,7 +191,10 @@ func main() {
         log.Fatal(err)
     }
 
-    fmt.Printf("%+v\n", appConfig)
+    // Print only a known non-secret field. Do not print or log the whole
+    // config struct — autoconfig does not redact secret-bearing fields
+    // (see "Loading secrets from files" above).
+    fmt.Printf("listening on %s:%d\n", appConfig.Address, appConfig.Port)
 }
 ```
 

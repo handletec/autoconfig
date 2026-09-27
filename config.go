@@ -55,6 +55,18 @@ type fieldMeta struct {
 	isStruct   bool
 }
 
+// fileBackedValue holds one successfully resolved "<ENV>_FILE" value,
+// queued during bindEnvStruct and applied directly to its destination
+// struct field after Viper's Unmarshal completes in ReadEnv. It exists only
+// for the lifetime of a single ReadEnv call — it is never stored on Config
+// or in Viper — so a later ReadEnv call cannot observe a stale
+// _FILE-sourced value from an earlier call.
+type fileBackedValue struct {
+	field reflect.Value // addressable, string-kind destination
+	path  []string      // presence-tracking field path
+	value string
+}
+
 // New creates a new isolated Config instance.
 func New(prefix string) *Config {
 	v := viper.New()
@@ -164,18 +176,33 @@ func (c *Config) ReadFile(s any) error {
 
 // ReadEnv binds environment variables using each field's mapstructure tag
 // and then unmarshals into s.
+//
+// String fields additionally support a sibling "<ENV>_FILE" environment
+// variable (e.g. PREFIX_DB_PASSWORD_FILE) whose value is a path to a file
+// containing the actual value — the Docker/Kubernetes secrets-file pattern.
+// _FILE values are resolved per call into a local slice (fileValues) and
+// applied directly to their destination struct fields after Unmarshal
+// completes; they are never written back into the process environment and
+// never persisted on Config or in Viper, so a later ReadEnv call cannot
+// observe a stale _FILE-sourced value from an earlier call.
 func (c *Config) ReadEnv(s any) error {
 	rv, err := structValueFromPointer(s)
 	if err != nil {
 		return fmt.Errorf("read environment: %w", err)
 	}
 
-	if err := c.bindEnvStruct(rv, c.rootPathForType(rv.Type()), nil); err != nil {
+	var fileValues []fileBackedValue
+	if err := c.bindEnvStruct(rv, c.rootPathForType(rv.Type()), nil, &fileValues); err != nil {
 		return err
 	}
 
 	if err := c.v.Unmarshal(s, decoderOptions()...); err != nil {
 		return fmt.Errorf("read environment: error unmarshaling: %w", err)
+	}
+
+	for _, fv := range fileValues {
+		fv.field.SetString(fv.value)
+		c.recordPresence(fv.path)
 	}
 
 	return nil
@@ -201,7 +228,7 @@ func (c *Config) ReadEnv(s any) error {
 // field, while the OS-facing environment variable name is still derived
 // from the field's own leaf mapstructure tag only (mergeEnvPrefix), so the
 // documented PREFIX_<mapstructure tag> contract for consumers is unchanged.
-func (c *Config) bindEnvStruct(rv reflect.Value, path []string, viperPath []string) error {
+func (c *Config) bindEnvStruct(rv reflect.Value, path []string, viperPath []string, fileValues *[]fileBackedValue) error {
 	metas, err := c.getOrBuildFieldMeta(rv.Type())
 	if err != nil {
 		return err
@@ -215,7 +242,7 @@ func (c *Config) bindEnvStruct(rv reflect.Value, path []string, viperPath []stri
 		if fm.isStruct {
 			nested, ok := ensureStructValue(field)
 			if ok {
-				if err := c.bindEnvStruct(nested, fieldPath, childViperPath); err != nil {
+				if err := c.bindEnvStruct(nested, fieldPath, childViperPath, fileValues); err != nil {
 					return fmt.Errorf("read environment: nested struct %q: %w", fm.name, err)
 				}
 			}
@@ -247,9 +274,102 @@ func (c *Config) bindEnvStruct(rv reflect.Value, path []string, viperPath []stri
 		if c.v.IsSet(viperKey) {
 			c.recordPresence(fieldPath)
 		}
+
+		if !fm.isStruct {
+			if err := c.resolveFileBackedValue(fm, field, fieldPath, osEnvName, fileValues); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
+}
+
+// resolveFileBackedValue checks the sibling "<osEnvName>_FILE" environment
+// variable for a scalar field and, if it is configured with non-empty
+// content after trimming exactly one trailing line ending, queues the
+// resulting value for direct application to field's destination after
+// Viper's Unmarshal completes in ReadEnv. Queuing is the only side effect
+// on success; field itself is never mutated here, so a later field's
+// failure elsewhere in the same bindEnvStruct traversal can never leave
+// this field partially applied.
+//
+//   - Neither the direct env var nor _FILE set, or _FILE set to an empty
+//     string: no-op — existing behaviour (config-file value, default,
+//     optional zero value, or required-check) is unaffected.
+//   - Direct env var and _FILE both set to non-empty values: a conflict
+//     error naming both environment variable names is returned; neither
+//     value is included in the error.
+//   - _FILE configured against a field whose own declared type is not
+//     string — including a pointer to string, or any other kind — is a
+//     clear unsupported-type error; _FILE is never silently ignored or
+//     speculatively handled for those fields. Only a bare (non-pointer)
+//     string field is supported, matching the approved scope exactly; this
+//     is intentionally narrower than the generic pointer-dereferencing used
+//     elsewhere in this file for unrelated purposes (nested struct
+//     recursion, default= application), since that broader pattern is
+//     untested for scalar pointer fields anywhere in this library and
+//     extending _FILE to it would be a speculative, unproven generalization.
+//   - _FILE points to a file that cannot be read: a hard error naming the
+//     _FILE variable and the path (never the file's contents) is returned;
+//     there is no fallback to a default.
+//   - _FILE's content, after stripping exactly one trailing "\n" or
+//     "\r\n", is empty: treated as though _FILE were not supplied at all —
+//     no presence is recorded and no value is queued, so an optional field
+//     keeps its existing value, a field with default= receives the default
+//     in Check(), and a required field with no default fails required
+//     validation exactly as if no _FILE had been supplied.
+func (c *Config) resolveFileBackedValue(fm fieldMeta, field reflect.Value, fieldPath []string, osEnvName string, fileValues *[]fileBackedValue) error {
+	osEnvNameFile := osEnvName + "_FILE"
+
+	fileRaw, hasFile := os.LookupEnv(osEnvNameFile)
+	if !hasFile || fileRaw == "" {
+		return nil
+	}
+
+	if directRaw, ok := os.LookupEnv(osEnvName); ok && directRaw != "" {
+		return fmt.Errorf("read environment: both %q and %q are set; provide only one", osEnvName, osEnvNameFile)
+	}
+
+	if field.Kind() != reflect.String {
+		return fmt.Errorf("read environment: %q is not supported: field %q is a %s, _FILE is only supported for string fields", osEnvNameFile, fm.name, field.Kind())
+	}
+
+	data, err := os.ReadFile(fileRaw)
+	if err != nil {
+		return fmt.Errorf("read environment: reading %q (path %q): %w", osEnvNameFile, fileRaw, err)
+	}
+
+	trimmed := trimTrailingLineEnding(string(data))
+	if trimmed == "" {
+		return nil
+	}
+
+	if !field.CanSet() {
+		return fmt.Errorf("read environment: cannot apply %q to field %q", osEnvNameFile, fm.name)
+	}
+
+	*fileValues = append(*fileValues, fileBackedValue{
+		field: field,
+		path:  append([]string(nil), fieldPath...),
+		value: trimmed,
+	})
+
+	return nil
+}
+
+// trimTrailingLineEnding removes exactly one trailing conventional line
+// ending ("\r\n" or "\n") from a file-backed secret value, if present. It
+// does not call strings.TrimSpace: leading/trailing spaces and internal
+// newlines may be part of the actual secret and must be preserved exactly.
+func trimTrailingLineEnding(s string) string {
+	if strings.HasSuffix(s, "\r\n") {
+		return s[:len(s)-2]
+	}
+	if strings.HasSuffix(s, "\n") {
+		return s[:len(s)-1]
+	}
+	return s
 }
 
 // viperKeySegment returns the path segment used to build the hierarchical

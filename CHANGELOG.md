@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added `_FILE` support for string environment-backed configuration values. Any environment-bindable string field (passwords, tokens, API keys, DSNs, signing secrets) now also accepts a sibling `<ENV>_FILE` environment variable (e.g. `MYAPP_DB_PASSWORD_FILE`) whose value is a path to a file containing the actual value — the Docker/Kubernetes secrets-file pattern. No new struct tag is required. The secret's contents are never written back into the process environment, never persisted on `Config`, and never stored in the internal Viper instance; they are resolved fresh on each `ReadEnv()` call and applied directly to the destination struct field. See the README's "Loading secrets from files" section for the full behaviour, including the direct-value/`_FILE` conflict error, the string-only scope, the empty-content-is-absent rule, and the trailing-newline convention.
+
+This is a backward-compatible, additive feature. Existing direct environment-variable behaviour, the `config` tag syntax, and the public API are all unchanged.
+
 ## [v1.1.1] — 2026-08-18
 
 ### Fixes
